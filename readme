@@ -1,0 +1,67 @@
+Skeleton + eval harness
+
+Build the pipeline end to end with stub stages that return hardcoded output. Wire ingest → triage → fake stage → merge → database → screen. Make sure a transcript can travel the whole path.
+
+Define the storage model now: a calls table, an insights table with typed JSON per stage, an evidence table linking insights to turn numbers. Make writes idempotent on (call_id, stage, version) so re-running replaces rather than duplicates.
+
+Build the harness as one command: run the pipeline over the dev set, output per-label precision, recall, agreement, and evidence overlap. Add a diff view showing which specific calls flipped between runs.
+
+Ingest, triage, metrics
+
+Build PII redaction with a reversible mapping stored separately. Build turn numbering and speaker role assignment. Trim the pre-connect audio using the recording offset.
+
+Write the triage router as rules — turn count, engagement patterns, hangup signatures — and validate its tier assignments against your labelled usability field.
+
+Compute the deterministic metrics: talk-time ratio, longest monologue, interruption count, dead air, speech rate, question count.
+
+Wire these into a report ops can actually open, and hand it to them.
+
+LLM stages, one at a time
+
+For each stage: write the prompt from the codebook entry, define the strict output schema with required evidence turns, add validation with one retry and dead-letter on second failure, stamp the output with model, prompt version, and knowledge version.
+
+Run the harness. Pull the twenty worst calls and read them individually. Identify the pattern. Change one thing. Re-run. Compare against the previous run using the diff.
+
+When the model and the annotator disagree and the model is right, fix the codebook and re-label those calls rather than patching the prompt.
+
+Order the stages by value: outcome first (easiest ground truth, plus you can cross-check against the dialer disposition), then compliance, then objections and intent, then the pitch dimensions, then fact extraction.
+
+For fact extraction specifically, test explicitly that a fact not discussed comes back null rather than invented, and wire ASR confidence through so uncertain numbers arrive tagged.
+
+Insert segmentation before the later stages so each one reads only the relevant call phase.
+
+Verifier + merge
+
+Build a pass that takes a claim plus its cited turns and judges whether those turns support it. Run it on compliance flags first.
+
+Evaluate it against your annotators' evidence spans — the question is whether it catches cases where the label was right but the reasoning wasn't.
+
+Build the merge step that assembles all stage outputs into one record, and add contradiction checks between fields that shouldn't co-occur. Track the contradiction rate as a quality signal.
+
+Review screen
+
+Build the queue with priority ordering: high-severity compliance flags, then model-versus-agent disposition disagreements, then a random sample.
+
+Build the review view: the claim, the cited turns pulled out, audio playback anchored at each turn's timestamp, ASR confidence surfaced inline, and an indication of where an expected disclosure was looked for and not found.
+
+Build confirm / reject / unsure with keyboard shortcuts, and the four reject reasons — wrong label, right label wrong evidence, ambiguous rule, ASR error.
+
+Add a blind mode for a slice of the queue where the model's answer is hidden, and store those responses separately from verification responses.
+
+Wire every response back into the gold set.
+
+Production + backfill
+
+Set up the queue and worker pool, retries with backoff, and dead-letter handling. Add cost tracking per stage per day.
+
+Build alerting on stage failure rate, schema validation failure rate, cost per call, and label distribution drift.
+
+Once stable, run the archive through, stamping every record with the versions that produced it.
+
+The left loop
+
+When a stage's failures trace back to an ambiguous definition rather than a bad prompt, edit the codebook file, bump its version, and re-label the calls affected by the change. Decide each time whether the change is clarifying (no past labels change) or breaking (past labels are now inconsistent and need redoing).
+
+The right loop
+
+Take confirmed and rejected reviews and write them into the gold set, tagged by whether they came from verification or blind mode. Periodically re-run the harness against the grown set to check whether stage performance is holding as the data broadens.
