@@ -1,0 +1,99 @@
+PL Call Analytics — Work Documentation
+Project: LLM-based compliance monitoring and transcript analytics for outbound personal loan telecalling
+Regulated entity: Kotak Mahindra Bank
+Volume: ~5,000 call recordings/day
+Status date: 21 August 2026
+1. Objective
+Convert raw outbound PL call recordings into consistent, auditable, call-level labels — compliance flags, call outcome, objections, customer intent, and extracted product facts (loan amount, interest rate, EMI, tenure).
+The governing constraint on the whole system: every call-level label must cite the specific transcript turn numbers that justify it. Labels without evidence spans are not acceptable for audit.
+2. Environment
+Layer
+Choice
+Compute
+AWS AI Hub (EMR-like managed platform), EMR Studio for notebooks
+ASR
+Oriserve/Whisper-Hindi2Hinglish-Apex (~800M params, Whisper architecture, ~1000h Indian conversational/call-centre audio)
+ASR output
+Romanized Hinglish (Latin script, not Devanagari)
+LLM inference
+AWS Bedrock, ap-south-1 — Qwen3-32B, gpt-oss-120b, Mistral Large 3 675B, DeepSeek V3.2
+Storage
+S3
+Audio
+Mono-channel WAV
+All four Bedrock models are regionally served with no cross-region inference profiles, which satisfies DPDP and RBI data-localisation requirements. All four support native JSON structured output via outputConfig.textFormat, so the pipeline uses structured output rather than tool-calling.
+3. Work completed
+3.1 ASR parameter tuning
+Problem. The production transcription call used chunk_length_s=10. Whisper's encoder is trained exclusively on 30-second windows and HF pads every chunk to 30s regardless, so 10s chunks create a train/inference distribution mismatch. Separately, the three fallback thresholds (compression_ratio_threshold, logprob_threshold, no_speech_threshold) were suspected inert, because a scalar temperature=0.0 never triggers the temperature-fallback loop. Language was also not pinned.
+Method. A two-round, human-judged parameter sweep across 15 decoding configurations. No WER, no gold transcripts, no metrics harness — this scope was deliberately cut to keep the cycle short. Transcripts were emitted blind-labelled, aligned across four 60–90 second windows per call (opening, numbers-heavy, difficult, close), and read side by side against a fixed rubric: deletions, degenerate loops, number accuracy, domain-term accuracy, script flipping, phantom text over silence.
+Round 1 — six windowing/chunking configurations.
+Round 2 — nine further changes stacked on the Round 1 winner: language pinning, n-gram blocking, beam search, temperature ladder, vocabulary priming.
+Result.
+Round 1 winner: config D — chunk_length_s=30, stride_length_s=3
+Round 2 winner: config I — no_repeat_ngram_size=0 (n-gram blocking disabled)
+Config N (beam search without n-gram blocking) judged worse than I.
+Recommended production configuration: chunk 30s, stride 3s, no n-gram guard, temperature=0.0 scalar, timestamps on, three fallback thresholds retained but understood to be inert in the chunked path.
+Open items from this workstream:
+Run a 50–100 call tail sample to confirm no degenerate loops appear with the n-gram guard off.
+Verify whether config L produced byte-identical output to baseline — that would confirm the thresholds are inert.
+Confirm whether source recordings are dual-channel with agent and customer on separate legs.
+3.2 Transcript preprocessing
+The ASR output arrives flat: no speaker labels, poor or absent punctuation, speaker_labels_present: false in the schema. Three recurring defects were characterised from real transcripts:
+Bank name garbling — Kotak transcribed as "Medra", "Ventra", "Maintha", "Mainina", "paandr", "mahendr", "kodak".
+Hallucination runs — nannannannan sequences emitted over silence.
+camelCase glue points — segment joins where both the space and the sentence-ending period are lost, e.g. chaahoongiNahin.
+Deliverables built and tested:
+preprocess_transcript.py — four ordered operations:
+Replace nan hallucination runs with [PAUSE] markers
+Split at camelCase glue points and sentence punctuation
+Break over-long lines at Hinglish discourse markers (Haan, Ji, Nahin, Ok, Achchha, Thik hai, …)
+Number the lines
+pl_transcript_preprocessing.ipynb — the fuller pipeline: S3 integration placeholders, validation, call profile building, chunking with overlap, diagnostics, and an offset integrity check.
+3.3 Speaker attribution
+Audio-based diarization (pyannote and similar) was ruled out — recordings are mono-channel and the time cost was not justified. Attribution is therefore text-only, inferred from linguistic signals.
+speaker-attribution-prompt.md — finalised and confirmed production-ready. Signals used, in rough order of strength:
+Possessive direction — aapka vs mera. The strongest generic signal.
+Right-party confirmation digit strings — agent-side.
+Competitor bank mentions — customer-side.
+Polite imperative endings — -kijie / -dijie, agent-side.
+A worked example is included in the prompt.
+Gender inference was explicitly removed from the prompt.
+3.4 System architecture
+A full technical reference was produced: pl-call-analytics-technical-doc-aws.md, revised twice as platform facts were confirmed.
+Stage design agreed:
+Ingest (no LLM) — PII redaction with a reversible mapping stored separately, turn numbering, speaker role assignment, trimming pre-connect dialer audio via recording offset.
+Triage router (rules only) — turn count, engagement patterns, hangup signatures; sorts into no-contact / short-refusal / substantive. Targets removal of ~60% of calls before any model call. This is a cost lever, not a quality lever, and sits upstream of all inference.
+Deterministic metrics (no LLM) — talk-time ratio, longest monologue, interruption count, dead air, speech rate, question count. Shippable to ops on its own.
+LLM stages, ordered by value: outcome → compliance → objections and intent → pitch dimensions → fact extraction. Strict output schema per stage, required evidence turns, validation with one retry then dead-letter, output stamped with model / prompt version / knowledge version.
+Verifier — independent of the labeller. Takes a claim plus its cited turns and judges whether those turns actually support the claim. Run on compliance flags first, where false positives are most expensive.
+Merge and contradiction rules — combine stage outputs into one call record, catch contradictions (e.g. outcome says converted while objection says hard refusal).
+Review screen — flagged claim, cited turns, audio, confirm/reject with reason.
+Storage model: a calls table, an insights table with typed JSON per stage, an evidence table linking insights to turn numbers. Writes idempotent on (call_id, stage, version) so re-runs replace rather than duplicate.
+3.5 Labelling governance
+Codebook — a versioned rulebook with anchored definitions, git-tracked, with a standing adjudication log. Shared source of truth for both human annotators and prompts.
+OKF — a markdown file-and-folder convention keeping product facts and rules in one place, readable by prompts and humans alike.
+Gold set — pilot first, compute per-label agreement; anything below 0.6 means the definition is broken and the codebook gets fixed before re-piloting. Main run: one annotator per call with 20–25% double-labelled throughout to watch drift, third-person adjudication, every adjudication written back as a codebook edge case. Then freeze, version, split dev/test, lock the test half away.
+4. Related subtask: address classification
+Separate workstream, ~10,000 addresses. Approach agreed:
+Normalise and deduplicate first
+Rules-based routing for the easy cases
+LLM batching, 25–50 addresses per call
+Two-model disagreement as the uncertainty signal
+A 250-call human gold set for measurement
+Distil to a lightweight classifier for ongoing use
+5. Not yet done
+Upstream fixes identified, not implemented:
+Persist ASR chunk timestamps — currently discarded despite return_timestamps: true being available.
+Populate agent and customer names from dialer or CRM metadata, and connect that metadata into preprocessing.
+Next build items:
+Finish the ASR sweep tail-check and lock the production config
+Compliance codebook and gold set
+Triage router
+Verifier stage
+Merge, contradiction, and PII redaction layers
+6. Working principles adopted
+Human judgment is the evaluation signal at ambiguous quality decisions; automated metrics were deliberately deprioritised for ASR.
+Never change two things at once. If three prompts move in an afternoon, causality is lost.
+Read individual failures, not aggregates. The number says something changed; the calls say what.
+When the model and the annotator disagree and the model is right, fix the codebook and re-label — don't patch the prompt.
+Scope aggressively. Cut anything that lengthens the cycle without changing the decision.
